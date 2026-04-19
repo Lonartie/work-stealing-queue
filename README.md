@@ -1,6 +1,6 @@
 # work-stealing-queue
 
-A single-header, lock-free, C++20 work-stealing deque with two variants:
+A single-header, lock-free, C++20 work-stealing deque used in [Taskflow](https://taskflow.github.io/). 
 
 | Class | Capacity | Push behaviour |
 |---|---|---|
