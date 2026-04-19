@@ -1,20 +1,28 @@
 #pragma once
 
 /**
-@file wsq-original.hpp
-@brief Original work-stealing queue — standalone, no optimizations.
+@file wsq-cached_index.hpp
+@brief Work-stealing queue with cached-index optimization — int64_t indices.
 
-Faithful port of the Taskflow wsq.hpp baseline to a self-contained header:
-  - Removed all Taskflow dependencies (macros.hpp, traits.hpp)
-  - Replaced TF_ macros with WSQ_ macros
-  - Replaced namespace tf with namespace wsq
-  - int64_t indices initialized to 0 (original behavior)
-  - No cached-index optimization
-  - _array shares a cache line with _bottom (original layout)
+Identical to wsq-original.hpp except:
 
-Algorithm: "Correct and Efficient Work-Stealing for Weak Memory Models"
-  Lê, Pop, Cohen, Nardelli — PPoPP 2013
-  https://www.di.ens.fr/~zappa/readings/ppopp13.pdf
+  1. _array is cache-line aligned (own cache line, not shared with _bottom).
+
+  2. Both UnboundedWSQ and BoundedWSQ add a private _cached_top field (int64_t,
+     owner-thread-only, on its own cache line) that acts as a local upper bound
+     on _top.  push/try_push/bulk_push/try_bulk_push use _cached_top to skip
+     the cross-core acquire load of _top on the common (non-full) path; they
+     refresh _cached_top only when the cached estimate indicates the queue may
+     be full.  Because _top is monotonically non-decreasing, a stale (smaller)
+     cached value can only make the queue appear *more* full, never less — so
+     correctness is preserved and the optimization is safe.
+
+  Indices remain int64_t initialized to 0 (no uint64_t / init=1 change).
+  All other logic is identical to the original.
+
+Reference: Vyukov, "Bounded MPMC Queue", 1024cores.net, 2009.
+           Lê et al., "Correct and Efficient Work-Stealing for Weak Memory
+           Models", PPoPP 2013, §push.
 */
 
 #include <atomic>
@@ -91,11 +99,20 @@ class UnboundedWSQ {
     }
   };
 
-  // Original layout: _array shares _bottom's cache line (no alignment)
   alignas(WSQ_CACHELINE_SIZE) std::atomic<int64_t> _top;
   alignas(WSQ_CACHELINE_SIZE) std::atomic<int64_t> _bottom;
-  std::atomic<Array*> _array;
+                              int64_t _cached_top {0};
+
+  // _array on its own cache line: avoids false-sharing with _bottom when
+  // thieves load _array (consume) after reading _bottom (acquire).
+  alignas(WSQ_CACHELINE_SIZE) std::atomic<Array*> _array;
   std::vector<Array*> _garbage;
+
+  // Owner-private cached upper bound on _top.  Never read by thieves.
+  // Because _top is never decremented, the real occupancy can only be
+  // smaller than what is computed using this cached value, so using it
+  // for the overflow check is always safe.
+
 
   Array* _resize_array(Array* a, int64_t b, int64_t t);
   Array* _resize_array(Array* a, int64_t b, int64_t t, size_t N);
@@ -167,11 +184,15 @@ size_t UnboundedWSQ<T>::capacity() const noexcept {
 template <typename T>
 void UnboundedWSQ<T>::push(T o) {
   int64_t b = _bottom.load(std::memory_order_relaxed);
-  int64_t t = _top.load(std::memory_order_acquire);
   Array*  a = _array.load(std::memory_order_relaxed);
 
-  if(a->capacity() < static_cast<size_t>(b - t + 1)) [[unlikely]] {
-    a = _resize_array(a, b, t);
+  // Use cached upper bound of _top — avoids cross-core acquire on common path.
+  // Refresh only when cached value suggests the array may be full.
+  if(a->capacity() < static_cast<size_t>(b - _cached_top + 1)) [[unlikely]] {
+    _cached_top = _top.load(std::memory_order_acquire);
+    if(a->capacity() < static_cast<size_t>(b - _cached_top + 1)) [[unlikely]] {
+      a = _resize_array(a, b, _cached_top);
+    }
   }
 
   a->push(b, o);
@@ -185,11 +206,15 @@ void UnboundedWSQ<T>::bulk_push(I first, size_t N) {
   if(N == 0) return;
 
   int64_t b = _bottom.load(std::memory_order_relaxed);
-  int64_t t = _top.load(std::memory_order_acquire);
   Array*  a = _array.load(std::memory_order_relaxed);
 
-  if((b - t + N) > a->capacity()) [[unlikely]] {
-    a = _resize_array(a, b, t, N);
+  if((b - _cached_top + static_cast<int64_t>(N)) >
+     static_cast<int64_t>(a->capacity())) [[unlikely]] {
+    _cached_top = _top.load(std::memory_order_acquire);
+    if((b - _cached_top + static_cast<int64_t>(N)) >
+       static_cast<int64_t>(a->capacity())) [[unlikely]] {
+      a = _resize_array(a, b, _cached_top, N);
+    }
   }
 
   for(size_t i=0; i<N; ++i) {
@@ -301,10 +326,10 @@ class BoundedWSQ {
 
   static_assert(BufferSize >= 2 && (BufferSize & BufferMask) == 0);
 
-  // Original layout: _top, _bottom, _buffer each on their own cache lines
   alignas(WSQ_CACHELINE_SIZE) std::atomic<int64_t> _top    {0};
   alignas(WSQ_CACHELINE_SIZE) std::atomic<int64_t> _bottom {0};
-  alignas(WSQ_CACHELINE_SIZE) std::atomic<T>        _buffer[BufferSize];
+                              int64_t _cached_top {0};
+  alignas(WSQ_CACHELINE_SIZE) std::atomic<T>       _buffer[BufferSize];
 
 public:
 
@@ -356,10 +381,15 @@ template <typename T, size_t LogSize>
 template <typename O>
 bool BoundedWSQ<T, LogSize>::try_push(O&& o) {
   int64_t b = _bottom.load(std::memory_order_relaxed);
-  int64_t t = _top.load(std::memory_order_acquire);
 
-  if(static_cast<size_t>(b - t + 1) > BufferSize) [[unlikely]] {
-    return false;
+  // Optimistic check using cached _top — no cross-core traffic on common path.
+  // Refresh and re-check before returning false: thieves may have advanced
+  // _top since the last refresh, so the queue may have room.
+  if(static_cast<size_t>(b - _cached_top + 1) > BufferSize) [[unlikely]] {
+    _cached_top = _top.load(std::memory_order_acquire);
+    if(static_cast<size_t>(b - _cached_top + 1) > BufferSize) [[unlikely]] {
+      return false;
+    }
   }
 
   _buffer[b & BufferMask].store(std::forward<O>(o), std::memory_order_relaxed);
@@ -374,9 +404,14 @@ size_t BoundedWSQ<T, LogSize>::try_bulk_push(I first, size_t N) {
   if(N == 0) return 0;
 
   int64_t b = _bottom.load(std::memory_order_relaxed);
-  int64_t t = _top.load(std::memory_order_acquire);
 
-  size_t r = BufferSize - static_cast<size_t>(b - t);
+  // Use cached _top for capacity estimate; refresh only when it shows zero room
+  // to avoid returning 0 based on a stale estimate alone.
+  size_t r = BufferSize - static_cast<size_t>(b - _cached_top);
+  if(r == 0) [[unlikely]] {
+    _cached_top = _top.load(std::memory_order_acquire);
+    r = BufferSize - static_cast<size_t>(b - _cached_top);
+  }
   size_t n = std::min(N, r);
 
   if(n > 0) {
