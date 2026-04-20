@@ -2,23 +2,7 @@
 
 /**
 @file wsq-cached_index.hpp
-@brief Work-stealing queue with cached-index optimization — int64_t indices.
-
-Identical to wsq-original.hpp except:
-
-  1. _array is cache-line aligned (own cache line, not shared with _bottom).
-
-  2. Both UnboundedWSQ and BoundedWSQ add a private _cached_top field (int64_t,
-     owner-thread-only, on its own cache line) that acts as a local upper bound
-     on _top.  push/try_push/bulk_push/try_bulk_push use _cached_top to skip
-     the cross-core acquire load of _top on the common (non-full) path; they
-     refresh _cached_top only when the cached estimate indicates the queue may
-     be full.  Because _top is monotonically non-decreasing, a stale (smaller)
-     cached value can only make the queue appear *more* full, never less — so
-     correctness is preserved and the optimization is safe.
-
-  Indices remain int64_t initialized to 0 (no uint64_t / init=1 change).
-  All other logic is identical to the original.
+@brief standalone work-stealing queue implementation extracted from the Taskflow project 
 
 Reference: Vyukov, "Bounded MPMC Queue", 1024cores.net, 2009.
            Lê et al., "Correct and Efficient Work-Stealing for Weak Memory
