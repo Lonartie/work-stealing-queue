@@ -1,7 +1,7 @@
 #pragma once
 
 /**
-@file wsq-cached_index.hpp
+@file wsq.hpp
 @brief standalone work-stealing queue implementation extracted from the Taskflow project 
 
 Reference: Vyukov, "Bounded MPMC Queue", 1024cores.net, 2009.
@@ -85,18 +85,17 @@ class UnboundedWSQ {
 
   alignas(WSQ_CACHELINE_SIZE) std::atomic<int64_t> _top;
   alignas(WSQ_CACHELINE_SIZE) std::atomic<int64_t> _bottom;
-                              int64_t _cached_top {0};
-
-  // _array on its own cache line: avoids false-sharing with _bottom when
-  // thieves load _array (consume) after reading _bottom (acquire).
-  alignas(WSQ_CACHELINE_SIZE) std::atomic<Array*> _array;
-  std::vector<Array*> _garbage;
 
   // Owner-private cached upper bound on _top.  Never read by thieves.
   // Because _top is never decremented, the real occupancy can only be
   // smaller than what is computed using this cached value, so using it
   // for the overflow check is always safe.
+  int64_t _cached_top {0};
 
+  // _array on its own cache line: avoids false-sharing with _bottom when
+  // thieves load _array (consume) after reading _bottom (acquire).
+  alignas(WSQ_CACHELINE_SIZE) std::atomic<Array*> _array;
+  std::vector<Array*> _garbage;
 
   Array* _resize_array(Array* a, int64_t b, int64_t t);
   Array* _resize_array(Array* a, int64_t b, int64_t t, size_t N);
@@ -192,11 +191,10 @@ void UnboundedWSQ<T>::bulk_push(I first, size_t N) {
   int64_t b = _bottom.load(std::memory_order_relaxed);
   Array*  a = _array.load(std::memory_order_relaxed);
 
-  if((b - _cached_top + static_cast<int64_t>(N)) >
-     static_cast<int64_t>(a->capacity())) [[unlikely]] {
+  // queue is full with N additional items
+  if((b - _cached_top + N) > a->capacity()) [[unlikely]] {
     _cached_top = _top.load(std::memory_order_acquire);
-    if((b - _cached_top + static_cast<int64_t>(N)) >
-       static_cast<int64_t>(a->capacity())) [[unlikely]] {
+    if((b - _cached_top + N) > a->capacity()) [[unlikely]] {
       a = _resize_array(a, b, _cached_top, N);
     }
   }
@@ -210,19 +208,23 @@ void UnboundedWSQ<T>::bulk_push(I first, size_t N) {
 
 template <typename T>
 typename UnboundedWSQ<T>::value_type UnboundedWSQ<T>::pop() {
-  int64_t b = _bottom.load(std::memory_order_relaxed) - 1;
-  Array*  a = _array.load(std::memory_order_relaxed);
+
+  int64_t b = _bottom.load(std::memory_order_relaxed) - 1; 
+  Array* a = _array.load(std::memory_order_relaxed);
   _bottom.store(b, std::memory_order_relaxed);
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  int64_t t = _top.load(std::memory_order_relaxed);
+  
+  _cached_top = _top.load(std::memory_order_relaxed);
 
   auto item = empty_value();
 
-  if(t <= b) {
+  if(_cached_top <= b) { 
     item = a->pop(b);
-    if(t == b) {
-      if(!_top.compare_exchange_strong(t, t+1,
-            std::memory_order_seq_cst, std::memory_order_relaxed)) {
+    if(_cached_top == b) {
+      // the last item just got stolen
+      if(!_top.compare_exchange_strong(_cached_top, _cached_top + 1,
+                                       std::memory_order_seq_cst,
+                                       std::memory_order_relaxed)) {
         item = empty_value();
       }
       _bottom.store(b + 1, std::memory_order_relaxed);
@@ -369,9 +371,9 @@ bool BoundedWSQ<T, LogSize>::try_push(O&& o) {
   // Optimistic check using cached _top — no cross-core traffic on common path.
   // Refresh and re-check before returning false: thieves may have advanced
   // _top since the last refresh, so the queue may have room.
-  if(static_cast<size_t>(b - _cached_top + 1) > BufferSize) [[unlikely]] {
+  if(static_cast<size_t>(b - _cached_top + 1) > BufferSize) {
     _cached_top = _top.load(std::memory_order_acquire);
-    if(static_cast<size_t>(b - _cached_top + 1) > BufferSize) [[unlikely]] {
+    if(static_cast<size_t>(b - _cached_top + 1) > BufferSize) {
       return false;
     }
   }
