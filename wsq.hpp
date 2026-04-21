@@ -214,15 +214,15 @@ typename UnboundedWSQ<T>::value_type UnboundedWSQ<T>::pop() {
   _bottom.store(b, std::memory_order_relaxed);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   
-  _cached_top = _top.load(std::memory_order_relaxed);
+  int64_t t = _top.load(std::memory_order_relaxed);
 
   auto item = empty_value();
 
-  if(_cached_top <= b) { 
+  if(t <= b) { 
     item = a->pop(b);
-    if(_cached_top == b) {
+    if(t == b) {
       // the last item just got stolen
-      if(!_top.compare_exchange_strong(_cached_top, _cached_top + 1,
+      if(!_top.compare_exchange_strong(t, t + 1,
                                        std::memory_order_seq_cst,
                                        std::memory_order_relaxed)) {
         item = empty_value();
