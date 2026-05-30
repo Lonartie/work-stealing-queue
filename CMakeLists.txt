@@ -24,24 +24,6 @@ target_include_directories(wsq INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(wsq INTERFACE cxx_std_20)
 
 # ---------------------------------------------------------------------------
-# Compiler warnings / optimisation flags
-# ---------------------------------------------------------------------------
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-  target_compile_options(wsq INTERFACE
-    $<$<CONFIG:Release>:-O3 -march=native>
-    $<$<CONFIG:Debug>:-O0 -g -fsanitize=address,undefined>
-  )
-  target_link_options(wsq INTERFACE
-    $<$<CONFIG:Debug>:-fsanitize=address,undefined>
-  )
-elseif(MSVC)
-  target_compile_options(wsq INTERFACE
-    $<$<CONFIG:Release>:/O2>
-    $<$<CONFIG:Debug>:/Od /Zi>
-  )
-endif()
-
-# ---------------------------------------------------------------------------
 # Threading
 # ---------------------------------------------------------------------------
 find_package(Threads REQUIRED)
@@ -50,6 +32,9 @@ target_link_libraries(wsq INTERFACE Threads::Threads)
 # ---------------------------------------------------------------------------
 # Sub-projects
 # ---------------------------------------------------------------------------
-enable_testing()
-add_subdirectory(unittests)
-add_subdirectory(examples)
+option(WSQ_ENABLE_TESTS "Enable Tests" OFF)
+if(WSQ_ENABLE_TESTS)
+  enable_testing()
+  add_subdirectory(unittests)
+  add_subdirectory(examples)
+endif()
